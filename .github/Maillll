@@ -1,70 +1,99 @@
-import os
-import email
-from email.header import decode_header
+#!/usr/bin/env python3
+import getpass
 import imaplib
-from dotenv import load_dotenv
+import sys
 
-load_dotenv()
-
-EMAIL_ACCOUNT = os.getenv("GMAIL_EMAIL")
-EMAIL_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 IMAP_SERVER = "imap.gmail.com"
+IMAP_PORT = 993
+EMAIL = "78mshahrani@gmail.com"
+BATCH_SIZE = 200
+CONFIRMATION = "DELETE ALL INBOX"
 
 
-def connect_imap(custom_email=None, custom_password=None):
-    account = custom_email or EMAIL_ACCOUNT
-    password = custom_password or EMAIL_PASSWORD
-    
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-        mail.login(account, password)
-        print("Connected successfully.")
-        return mail
-    except imaplib.IMAP4.error as e:
-        print(f"Connection failed: {e}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        return None
-
-
-def decode_email_header(value):
-    if not value:
-        return "(No Subject)"
+def main():
+    mailbox = None
 
     try:
-        decoded_parts = []
-        for part, encoding in decode_header(value):
-            if isinstance(part, bytes):
-                decoded_parts.append(part.decode(encoding or "utf-8", errors="ignore"))
-            else:
-                decoded_parts.append(part)
-        return "".join(decoded_parts)
-    except Exception:
-        return str(value)
+        password = getpass.getpass("Gmail app password: ")
+        if not password:
+            print("No password entered.")
+            return
+
+        mailbox = imaplib.IMAP4_SSL(
+            IMAP_SERVER,
+            IMAP_PORT,
+            timeout=30,
+        )
+        mailbox.login(EMAIL, password)
+
+        status, _ = mailbox.select("INBOX")
+        if status != "OK":
+            raise RuntimeError("Could not open the inbox.")
+
+        capabilities = {
+            item.decode("ascii", "ignore").upper()
+            if isinstance(item, bytes)
+            else str(item).upper()
+            for item in mailbox.capabilities
+        }
+        if "UIDPLUS" not in capabilities:
+            raise RuntimeError("The server does not support safe UID expunge.")
+
+        status, data = mailbox.uid("SEARCH", None, "ALL")
+        if status != "OK":
+            raise RuntimeError("Could not search the inbox.")
+
+        uids = data[0].split()
+        print(f"Account: {EMAIL}")
+        print(f"Messages in inbox: {len(uids)}")
+
+        if not uids:
+            return
+
+        confirmation = input(
+            f'Type "{CONFIRMATION}" to delete these messages: '
+        ).strip()
+
+        if confirmation != CONFIRMATION:
+            print("Cancelled. No messages were deleted.")
+            return
+
+        marked_batches = []
+
+        for start in range(0, len(uids), BATCH_SIZE):
+            batch = uids[start:start + BATCH_SIZE]
+            uid_set = ",".join(uid.decode("ascii") for uid in batch)
+
+            status, _ = mailbox.uid(
+                "STORE", uid_set, "+FLAGS.SILENT", r"(\Deleted)"
+            )
+
+            if status != "OK":
+                for marked in marked_batches + [uid_set]:
+                    mailbox.uid(
+                        "STORE", marked, "-FLAGS.SILENT", r"(\Deleted)"
+                    )
+                raise RuntimeError("Failed to mark a batch for deletion.")
+
+            marked_batches.append(uid_set)
+
+        for uid_set in marked_batches:
+            status, _ = mailbox.uid("EXPUNGE", uid_set)
+            if status != "OK":
+                raise RuntimeError("Failed to expunge a batch.")
+
+        print(f"Deleted {len(uids)} messages.")
+
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+
+    finally:
+        if mailbox is not None:
+            try:
+                mailbox.logout()
+            except imaplib.IMAP4.error:
+                pass
 
 
-def get_email_body(msg):
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition"))
-
-            if content_type == "text/plain" and "attachment" not in content_disposition:
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="ignore")
-
-            if content_type == "text/html" and "attachment" not in content_disposition:
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="ignore")
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or "utf-8"
-            return payload.decode(charset, errors="ignore")
-
-    return "(No Text)"
+if __name__ == "__main__":
+    main()
