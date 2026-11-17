@@ -1,99 +1,213 @@
-#!/usr/bin/env python3
-import getpass
-import imaplib
-import sys
-
-IMAP_SERVER = "imap.gmail.com"
-IMAP_PORT = 993
-EMAIL = "78mshahrani@gmail.com"
-BATCH_SIZE = 200
-CONFIRMATION = "DELETE ALL INBOX"
+import re
+import csv
 
 
-def main():
-    mailbox = None
+class ContactImporter:
+    """Import and parse contact data from text files."""
 
-    try:
-        password = getpass.getpass("Gmail app password: ")
-        if not password:
-            print("No password entered.")
-            return
+    EMAIL_PATTERN = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+    PHONE_PATTERN = re.compile(r'[\+]?[(]?[0-9]{1,4}[)]?[-\s\./0-9]{6,15}')
+    URL_PATTERN = re.compile(r'https?://[^\s]+')
+    NAME_PATTERN = re.compile(r'(?:name|الاسم)\s*[:：]\s*(.+)', re.IGNORECASE)
 
-        mailbox = imaplib.IMAP4_SSL(
-            IMAP_SERVER,
-            IMAP_PORT,
-            timeout=30,
-        )
-        mailbox.login(EMAIL, password)
+    def __init__(self, file_path: str, encoding: str = 'utf-8'):
+        self.file_path = file_path
+        self.encoding = encoding
+        self.contacts = []
+        self.errors = []
 
-        status, _ = mailbox.select("INBOX")
-        if status != "OK":
-            raise RuntimeError("Could not open the inbox.")
+    def read_file(self) -> str:
+        """Read the text file."""
+        try:
+            with open(self.file_path, 'r', encoding=self.encoding) as f:
+                return f.read()
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {self.file_path}")
+        except UnicodeDecodeError:
+            raise ValueError("Encoding error. Try a different encoding.")
 
-        capabilities = {
-            item.decode("ascii", "ignore").upper()
-            if isinstance(item, bytes)
-            else str(item).upper()
-            for item in mailbox.capabilities
+    def parse_with_notes(self, text: str) -> list:
+        """Parse text and extract contacts with notes."""
+        contacts = []
+        current_contact = {}
+        current_notes = []
+        lines = text.strip().split('\n')
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if not line:
+                i += 1
+                continue
+
+            if line.startswith('#'):
+                note_text = line[1:].strip()
+                current_notes.append(note_text)
+                i += 1
+                continue
+
+            if current_contact and current_notes:
+                current_contact['notes'] = ' '.join(current_notes)
+                current_notes = []
+
+            emails = self.EMAIL_PATTERN.findall(line)
+            phones = self.PHONE_PATTERN.findall(line)
+
+            if emails or phones:
+                if current_contact and (current_contact.get('email') or current_contact.get('phone')):
+                    if current_notes:
+                        current_contact['notes'] = ' '.join(current_notes)
+                        current_notes = []
+                    contacts.append(current_contact)
+
+                current_contact = {
+                    'email': emails[0] if emails else None,
+                    'phone': phones[0] if phones else None,
+                    'line_number': i + 1
+                }
+
+                name_match = self.NAME_PATTERN.search(line)
+                if name_match:
+                    current_contact['name'] = name_match.group(1).strip()
+
+                urls = self.URL_PATTERN.findall(line)
+                if urls:
+                    current_contact['url'] = urls[0]
+
+            i += 1
+
+        if current_contact and (current_contact.get('email') or current_contact.get('phone')):
+            if current_notes:
+                current_contact['notes'] = ' '.join(current_notes)
+            contacts.append(current_contact)
+
+        return contacts
+
+    def add_contact(self, name: str, email: str, phone: str = None, url: str = None, notes: str = None):
+        """Add a contact manually."""
+        contact = {
+            'name': name,
+            'email': email,
+            'phone': phone,
+            'url': url,
+            'notes': notes,
+            'line_number': len(self.contacts) + 1
         }
-        if "UIDPLUS" not in capabilities:
-            raise RuntimeError("The server does not support safe UID expunge.")
+        self.contacts.append(contact)
+        return contact
 
-        status, data = mailbox.uid("SEARCH", None, "ALL")
-        if status != "OK":
-            raise RuntimeError("Could not search the inbox.")
+    def import_contacts(self) -> dict:
+        """Main function to import and parse contacts."""
+        try:
+            text = self.read_file()
+            contacts = self.parse_with_notes(text)
 
-        uids = data[0].split()
-        print(f"Account: {EMAIL}")
-        print(f"Messages in inbox: {len(uids)}")
+            for contact in contacts:
+                contact = {k: v for k, v in contact.items() if v is not None}
 
-        if not uids:
-            return
+            self.contacts = contacts
 
-        confirmation = input(
-            f'Type "{CONFIRMATION}" to delete these messages: '
-        ).strip()
+            return {
+                'success': True,
+                'total_contacts': len(contacts),
+                'contacts': contacts,
+                'errors': self.errors
+            }
 
-        if confirmation != CONFIRMATION:
-            print("Cancelled. No messages were deleted.")
-            return
+        except Exception as e:
+            self.errors.append(str(e))
+            return {
+                'success': False,
+                'total_contacts': 0,
+                'contacts': [],
+                'errors': self.errors
+            }
 
-        marked_batches = []
+    def export_to_csv(self, output_path: str = 'contacts_export.csv'):
+        """Export contacts to CSV file."""
+        if not self.contacts:
+            raise ValueError("No contacts to export. Import data first.")
 
-        for start in range(0, len(uids), BATCH_SIZE):
-            batch = uids[start:start + BATCH_SIZE]
-            uid_set = ",".join(uid.decode("ascii") for uid in batch)
+        fieldnames = ['name', 'email', 'phone', 'url', 'notes', 'line_number']
 
-            status, _ = mailbox.uid(
-                "STORE", uid_set, "+FLAGS.SILENT", r"(\Deleted)"
-            )
+        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
 
-            if status != "OK":
-                for marked in marked_batches + [uid_set]:
-                    mailbox.uid(
-                        "STORE", marked, "-FLAGS.SILENT", r"(\Deleted)"
-                    )
-                raise RuntimeError("Failed to mark a batch for deletion.")
+            for contact in self.contacts:
+                writer.writerow(contact)
 
-            marked_batches.append(uid_set)
+        return output_path
 
-        for uid_set in marked_batches:
-            status, _ = mailbox.uid("EXPUNGE", uid_set)
-            if status != "OK":
-                raise RuntimeError("Failed to expunge a batch.")
+    def get_summary(self) -> dict:
+        """Get statistics about imported contacts."""
+        if not self.contacts:
+            return {'message': 'No data'}
 
-        print(f"Deleted {len(uids)} messages.")
+        emails = [c['email'] for c in self.contacts if c.get('email')]
+        phones = [c['phone'] for c in self.contacts if c.get('phone')]
+        urls = [c['url'] for c in self.contacts if c.get('url')]
 
-    except (imaplib.IMAP4.error, OSError, RuntimeError) as error:
-        print(f"Error: {error}", file=sys.stderr)
-
-    finally:
-        if mailbox is not None:
-            try:
-                mailbox.logout()
-            except imaplib.IMAP4.error:
-                pass
+        return {
+            'total_contacts': len(self.contacts),
+            'with_email': len(emails),
+            'with_phone': len(phones),
+            'with_url': len(urls),
+            'with_notes': sum(1 for c in self.contacts if c.get('notes')),
+            'with_name': sum(1 for c in self.contacts if c.get('name'))
+        }
 
 
-if __name__ == "__main__":
-    main()
+# ==================== Usage Example ====================
+
+if __name__ == '__main__':
+    sample_text = """
+# Search - regarding imports
+contact: 78mshahrani@gmail.com
+Note: Contains Arabic comment
+https://www.bing.com/
+
+# Another contact
+name: Ahmed Mohammed
+contact: ahmed@example.com
+phone: +966 50 123 4567
+"""
+
+    with open('contacts_sample.txt', 'w', encoding='utf-8') as f:
+        f.write(sample_text)
+
+    importer = ContactImporter('contacts_sample.txt')
+    result = importer.import_contacts()
+
+    if result['success']:
+        print(f"Imported {result['total_contacts']} contacts successfully\n")
+
+        summary = importer.get_summary()
+        print("Statistics:")
+        for key, value in summary.items():
+            print(f"  {key}: {value}")
+
+        print("\nContact Details:")
+        for i, contact in enumerate(result['contacts'], 1):
+            print(f"\n  Contact {i}:")
+            for key, value in contact.items():
+                print(f"    {key}: {value}")
+
+        # Add your account
+        importer.add_contact(
+            name="Shahrani",
+            email="78mshahrani@gmail.com",
+            notes="Personal account - data import"
+        )
+        print("\nYour account added successfully")
+
+        summary = importer.get_summary()
+        print(f"Total contacts after addition: {summary['total_contacts']}")
+
+        csv_file = importer.export_to_csv('contacts_output.csv')
+        print(f"Exported to: {csv_file}")
+    else:
+        print("Error during import:")
+        for error in result['errors']:
+            print(f"  - {error}")
