@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+import getpass
+import imaplib
+import sys
+
+IMAP_SERVER = "imap.gmail.com"
+IMAP_PORT = 993
+EMAIL = "78mshahrani@gmail.com"
+BATCH_SIZE = 200
+CONFIRMATION = "DELETE ALL INBOX"
+
+
+def main():
+    mailbox = None
+
+    try:
+        password = getpass.getpass("Gmail app password: ")
+        if not password:
+            print("No password entered.")
+            return
+
+        mailbox = imaplib.IMAP4_SSL(
+            IMAP_SERVER,
+            IMAP_PORT,
+            timeout=30,
+        )
+        mailbox.login(EMAIL, password)
+
+        status, _ = mailbox.select("INBOX")
+        if status != "OK":
+            raise RuntimeError("Could not open the inbox.")
+
+        capabilities = {
+            item.decode("ascii", "ignore").upper()
+            if isinstance(item, bytes)
+            else str(item).upper()
+            for item in mailbox.capabilities
+        }
+        if "UIDPLUS" not in capabilities:
+            raise RuntimeError("The server does not support safe UID expunge.")
+
+        status, data = mailbox.uid("SEARCH", None, "ALL")
+        if status != "OK":
+            raise RuntimeError("Could not search the inbox.")
+
+        uids = data[0].split()
+        print(f"Account: {EMAIL}")
+        print(f"Messages in inbox: {len(uids)}")
+
+        if not uids:
+            return
+
+        confirmation = input(
+            f'Type "{CONFIRMATION}" to delete these messages: '
+        ).strip()
+
+        if confirmation != CONFIRMATION:
+            print("Cancelled. No messages were deleted.")
+            return
+
+        marked_batches = []
+
+        for start in range(0, len(uids), BATCH_SIZE):
+            batch = uids[start:start + BATCH_SIZE]
+            uid_set = ",".join(uid.decode("ascii") for uid in batch)
+
+            status, _ = mailbox.uid(
+                "STORE", uid_set, "+FLAGS.SILENT", r"(\Deleted)"
+            )
+
+            if status != "OK":
+                for marked in marked_batches + [uid_set]:
+                    mailbox.uid(
+                        "STORE", marked, "-FLAGS.SILENT", r"(\Deleted)"
+                    )
+                raise RuntimeError("Failed to mark a batch for deletion.")
+
+            marked_batches.append(uid_set)
+
+        for uid_set in marked_batches:
+            status, _ = mailbox.uid("EXPUNGE", uid_set)
+            if status != "OK":
+                raise RuntimeError("Failed to expunge a batch.")
+
+        print(f"Deleted {len(uids)} messages.")
+
+    except (imaplib.IMAP4.error, OSError, RuntimeError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+
+    finally:
+        if mailbox is not None:
+            try:
+                mailbox.logout()
+            except imaplib.IMAP4.error:
+                pass
+
+
+if __name__ == "__main__":
+    main()
